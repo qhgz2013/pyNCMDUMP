@@ -1,8 +1,9 @@
-### Update `ncm_converter.py` file (Feb 2025)
+### Update `ncm_converter.py` file (May 2025)
 
 Changes:
 1. The [PyCrypto](https://www.pycrypto.org) package is no longer activaly maintained. So the latest version change to the [Cryptography](https://pypi.org/project/cryptography/), which can be installed through `pip install cryptography`.
 2. Added some additional command line options support. You can now choose the target folder you want to output to, and the timestamps to only process files created after this time.
+3. Added functionality for exporting embedded cover image in ncm file (which `ffmpeg` is required to be installed)
 
 ```
 $ python3 ncmdump.py --help

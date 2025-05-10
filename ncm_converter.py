@@ -10,8 +10,14 @@ from textwrap import dedent
 from multiprocessing import Pool
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-import time
-from datetime import datetime 
+from datetime import datetime
+from io import BytesIO
+import win32pipe
+import win32file
+import subprocess
+import threading
+import sys
+
 
 class TqdmLoggingHandler(logging.StreamHandler):
     """Avoid tqdm progress bar interruption by logger's output to console"""
@@ -37,9 +43,73 @@ fmt = '%(levelname)7s [%(asctime)s] %(message)s'
 datefmt = '%Y-%m-%d %H:%M:%S'
 handler.setFormatter(logging.Formatter(fmt, datefmt))
 log.addHandler(handler)
+DEFAULT_CHUNK_SIZE = 65536
 
 
-def dump_single_file(filepath, target_folder, after_timestamp=None):
+def find_ffmpeg() -> str | None:
+    paths = sys.path
+    paths += os.environ['PATH'].split(';')
+    for path in paths:
+        if len(path) == 0:
+            continue
+        full_path = os.path.join(path, 'ffmpeg.exe')
+        if os.path.exists(full_path):
+            log.info(f'found FFMpeg in {full_path}')
+            return full_path
+
+
+def create_pipe(pipe_name):
+    return win32pipe.CreateNamedPipe(
+        pipe_name, win32pipe.PIPE_ACCESS_DUPLEX,
+        win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+        1, DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, 0, None  # pyright:ignore[reportArgumentType]
+    )
+
+
+def connect_and_write_pipe(pipe_fd, data):
+    win32pipe.ConnectNamedPipe(pipe_fd, None)
+    with memoryview(data) as mv:
+        for i in range(0, len(data), DEFAULT_CHUNK_SIZE):
+            win32file.WriteFile(pipe_fd, mv[i:i+DEFAULT_CHUNK_SIZE])
+    win32file.CloseHandle(pipe_fd)
+
+
+def merge_audio_with_cover(ffmpeg_path, blob_audio, blob_cover_img, output_format):
+    pid = os.getpid()
+    named_pipe_img = rf'\\.\pipe\ncm_conv_{pid}_img'
+    named_pipe_audio = rf'\\.\pipe\ncm_conv_{pid}_audio'
+    img_pipe = None
+    audio_pipe = None
+    try:
+        img_pipe = create_pipe(named_pipe_img)
+        audio_pipe = create_pipe(named_pipe_audio)
+        cmd = [ffmpeg_path, '-v', 'quiet', '-i', named_pipe_img, '-i', named_pipe_audio, '-c', 'copy', '-map', '0:0', '-disposition:v', 'attached_pic', '-map', '1', '-map_metadata', '1', '-f', output_format, '-']
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        stdout_buf = BytesIO()
+        
+        def read_calls():
+            assert proc.stdout
+            while True:
+                buf = proc.stdout.read(DEFAULT_CHUNK_SIZE)
+                if not buf:
+                    break
+                stdout_buf.write(buf)
+        t = threading.Thread(target=read_calls)
+        t.start()
+        connect_and_write_pipe(img_pipe, blob_cover_img)
+        connect_and_write_pipe(audio_pipe, blob_audio)
+        assert proc.wait() == 0
+        t.join()
+        return stdout_buf.getvalue()
+
+    finally:
+        if img_pipe:
+            win32file.CloseHandle(img_pipe)
+        if audio_pipe:
+            win32file.CloseHandle(audio_pipe)
+
+
+def dump_single_file(filepath, target_folder, after_timestamp=None, ffmpeg_path=None):
     try:
         if after_timestamp:
             creation_time = os.path.getctime(filepath)
@@ -113,7 +183,7 @@ def dump_single_file(filepath, target_folder, after_timestamp=None):
             image_data = f.read(image_size)
             target_filename = os.path.join(target_folder, f'{filename}.{meta_data["format"]}')
 
-            with open(target_filename, 'wb') as m:
+            with BytesIO() as m:
                 chunk = bytearray()
                 while True:
                     chunk = bytearray(f.read(0x8000))
@@ -124,6 +194,12 @@ def dump_single_file(filepath, target_folder, after_timestamp=None):
                         j = i & 0xff
                         chunk[i - 1] ^= key_box[(key_box[j] + key_box[(key_box[j] + j) & 0xff]) & 0xff]
                     m.write(chunk)
+
+                audio_data = m.getvalue()
+                if ffmpeg_path:
+                    audio_data = merge_audio_with_cover(ffmpeg_path, audio_data, image_data, meta_data["format"])
+            with open(target_filename, 'wb') as m:
+                m.write(audio_data)
         log.info(f'Converted file saved at "{target_filename}"')
         return target_filename
 
@@ -140,10 +216,10 @@ def list_filepaths(path):
     else:
         raise ValueError(f'path not recognized: {path}')
 
-def process_file(fp, target_folder, after_timestamp):
-    dump_single_file(fp, target_folder or os.path.dirname(fp), after_timestamp)
+def process_file(fp, target_folder, after_timestamp, ffmpeg_path):
+    dump_single_file(fp, target_folder or os.path.dirname(fp), after_timestamp, ffmpeg_path)
 
-def dump(*paths, n_workers=None, target_folder=None, after_timestamp=None):
+def dump(*paths, n_workers=1, target_folder=None, after_timestamp=None, ffmpeg_path=None):
     header = dedent(r'''
                    _  _  ___ __  __ ___  _   _ __  __ ___
          _ __ _  _| \| |/ __|  \/  |   \| | | |  \/  | _ \
@@ -156,16 +232,18 @@ def dump(*paths, n_workers=None, target_folder=None, after_timestamp=None):
     for line in header.split('\n'):
         log.info(line)
 
+    if ffmpeg_path is None:
+        ffmpeg_path = find_ffmpeg()
     all_filepaths = [fp for p in paths for fp in list_filepaths(p)]
     if n_workers > 1:
         log.info(f'Running pyNCMDUMP with up to {n_workers} parallel workers')
         with Pool(processes=n_workers) as p:
-            list(p.starmap(process_file, [(fp, target_folder, after_timestamp) for fp in all_filepaths]))
+            list(p.starmap(process_file, [(fp, target_folder, after_timestamp, ffmpeg_path) for fp in all_filepaths]))
             # list(p.map(lambda fp: process_file(fp, target_folder, after_timestamp), all_filepaths))  # Use the new function
     else:
         log.info('Running pyNCMDUMP on single-worker mode')
         for fp in tqdm(all_filepaths, leave=False):
-            dump_single_file(fp, target_folder or os.path.dirname(fp), after_timestamp)  # Use target_folder
+            dump_single_file(fp, target_folder or os.path.dirname(fp), after_timestamp, ffmpeg_path)  # Use target_folder
     log.info('All finished')
 
 
@@ -200,6 +278,9 @@ if __name__ == '__main__':
         type=str,
         help='optional timestamp in yymmddhhmm format to only process files created after this time',
     )
+
+    parser.add_argument('--ffmpeg_path', type=str, default=None,
+                        help='ffmpeg executable path for merging audio with embedded cover image')
     
     args = parser.parse_args()
 
@@ -213,4 +294,4 @@ if __name__ == '__main__':
             exit(1)
 
     args = parser.parse_args()
-    dump(*args.paths, n_workers=args.workers, target_folder=args.target_folder, after_timestamp=after_timestamp)
+    dump(*args.paths, n_workers=args.workers, target_folder=args.target_folder, after_timestamp=after_timestamp, ffmpeg_path=args.ffmpeg_path)
