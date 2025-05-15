@@ -74,7 +74,7 @@ def connect_and_write_pipe(pipe_fd, data):
     win32file.CloseHandle(pipe_fd)
 
 
-def merge_audio_with_cover(ffmpeg_path, blob_audio, blob_cover_img, output_format):
+def merge_audio_with_cover(ffmpeg_path, blob_audio, blob_cover_img, output_file):
     pid = os.getpid()
     named_pipe_img = rf'\\.\pipe\ncm_conv_{pid}_img'
     named_pipe_audio = rf'\\.\pipe\ncm_conv_{pid}_audio'
@@ -83,25 +83,11 @@ def merge_audio_with_cover(ffmpeg_path, blob_audio, blob_cover_img, output_forma
     try:
         img_pipe = create_pipe(named_pipe_img)
         audio_pipe = create_pipe(named_pipe_audio)
-        cmd = [ffmpeg_path, '-v', 'quiet', '-i', named_pipe_img, '-i', named_pipe_audio, '-c', 'copy', '-map', '0:0', '-disposition:v', 'attached_pic', '-map', '1', '-map_metadata', '1', '-f', output_format, '-']
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        stdout_buf = BytesIO()
-        
-        def read_calls():
-            assert proc.stdout
-            while True:
-                buf = proc.stdout.read(DEFAULT_CHUNK_SIZE)
-                if not buf:
-                    break
-                stdout_buf.write(buf)
-        t = threading.Thread(target=read_calls)
-        t.start()
+        cmd = [ffmpeg_path, '-v', 'quiet', '-y', '-i', named_pipe_img, '-i', named_pipe_audio, '-c', 'copy', '-map', '0:0', '-disposition:v', 'attached_pic', '-map', '1', '-map_metadata', '1', output_file]
+        proc = subprocess.Popen(cmd)
         connect_and_write_pipe(img_pipe, blob_cover_img)
         connect_and_write_pipe(audio_pipe, blob_audio)
         assert proc.wait() == 0
-        t.join()
-        return stdout_buf.getvalue()
-
     finally:
         if img_pipe:
             win32file.CloseHandle(img_pipe)
@@ -197,9 +183,10 @@ def dump_single_file(filepath, target_folder, after_timestamp=None, ffmpeg_path=
 
                 audio_data = m.getvalue()
                 if ffmpeg_path:
-                    audio_data = merge_audio_with_cover(ffmpeg_path, audio_data, image_data, meta_data["format"])
-            with open(target_filename, 'wb') as m:
-                m.write(audio_data)
+                    merge_audio_with_cover(ffmpeg_path, audio_data, image_data, target_filename)
+                else:
+                    with open(target_filename, 'wb') as m:
+                        m.write(audio_data)
         log.info(f'Converted file saved at "{target_filename}"')
         return target_filename
 
